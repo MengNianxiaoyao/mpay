@@ -19,6 +19,7 @@ use app\repository\payment\config\PaymentChannelRepository;
 use app\repository\payment\trade\BizOrderRepository;
 use app\repository\payment\trade\PayOrderRepository;
 use DateTimeImmutable;
+use DOMDocument;
 use DOMNode;
 use DOMXPath;
 use InvalidArgumentException;
@@ -427,10 +428,115 @@ final class WechatReceiptPayment extends BasePayment implements PaymentInterface
             $this->receiptResult(
                 $this->locateReceipt($record, $context['channel_id'], $context['received_at']),
                 $record,
-                $payload->post(),
+                $this->evidence($payload->post()),
                 $context['received_at'],
             ),
         ];
+    }
+
+    /**
+     * 入库证据：PC 监听转发的消息带大量样式、图标、重复摘要和跳转链接，
+     * 整段保存会超过仓储 8KB 上限被截断。只在入库前精简，解析仍用完整原文。
+     *
+     * @param array<string,mixed> $post
+     * @return array<string,mixed>
+     */
+    private function evidence(array $post): array
+    {
+        // 转发请求形如 {from, content, timestamp, sign}，content 是 wxtool 事件信封的 JSON 字符串。
+        $nested = is_string($post['content'] ?? null);
+        if ($nested) {
+            try {
+                $envelope = json_decode($post['content'], true, 32, JSON_THROW_ON_ERROR);
+            } catch (JsonException) {
+                return $post;
+            }
+            if (!is_array($envelope)) {
+                return $post;
+            }
+        } elseif (is_array($post['message'] ?? null)) {
+            $envelope = $post;
+        } else {
+            return $post;
+        }
+        $xml = $envelope['message']['content'] ?? null;
+        if (!is_string($xml) || !str_contains($xml, '<msg>')) {
+            return $post;
+        }
+        $envelope['message']['content'] = $this->compactContent($xml);
+        if ($nested) {
+            try {
+                $post['content'] = json_encode(
+                    $envelope,
+                    JSON_THROW_ON_ERROR | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES,
+                    32,
+                );
+            } catch (JsonException) {
+                return $post;
+            }
+            return $post;
+        }
+        return $envelope;
+    }
+
+    /** 白名单重建：保留来源、标题、公众号与全部明细行，去掉样式、链接、图标及重复摘要。 */
+    private function compactContent(string $content): string
+    {
+        try {
+            $root = $this->xml->parse($content);
+        } catch (\Throwable) {
+            return $content;
+        }
+        $source = $root->ownerDocument;
+        if ($source === null) {
+            return $content;
+        }
+        $xpath = new DOMXPath($source);
+        $document = new DOMDocument('1.0', 'UTF-8');
+        $msg = $document->createElement('msg');
+        $document->appendChild($msg);
+        $copy = static function (string $path, \DOMNode $target) use ($xpath, $document): void {
+            $nodes = $xpath->query($path);
+            if ($nodes === false) {
+                return;
+            }
+            foreach ($nodes as $node) {
+                $target->appendChild($document->importNode($node, true));
+            }
+        };
+        $wrap = static function (string $name) use ($document): \DOMElement {
+            return $document->createElement($name);
+        };
+        $appmsg = $wrap('appmsg');
+        $reader = $wrap('mmreader');
+        $publisher = $wrap('publisher');
+        $detail = $wrap('template_detail');
+        $copy('/msg/fromusername', $msg);
+        $copy('/msg/appinfo/appname', $msg);
+        $copy('/msg/appmsg/title', $appmsg);
+        $msg->appendChild($appmsg);
+        $copy('/msg/appmsg/mmreader/category/name', $reader);
+        $copy('/msg/appmsg/mmreader/publisher/username', $publisher);
+        $reader->appendChild($publisher);
+        $copy('/msg/appmsg/mmreader/template_detail/line_content', $detail);
+        $reader->appendChild($detail);
+        $appmsg->appendChild($reader);
+        // 明细行内的颜色、样式和空白只用于展示，不是到账依据。
+        $trim = new DOMXPath($document);
+        foreach (['//color', '//wxcolors', '//hide_dash_line', '//small_text_count'] as $path) {
+            $nodes = $trim->query($path);
+            if ($nodes === false) {
+                continue;
+            }
+            foreach (iterator_to_array($nodes) as $node) {
+                $node->parentNode?->removeChild($node);
+            }
+        }
+        foreach (iterator_to_array($trim->query('//text()[normalize-space(.)=""]')) as $node) {
+            $node->parentNode?->removeChild($node);
+        }
+        $text = $document->saveXML($msg);
+        return is_string($text) && $text !== '' ? $text : $content;
     }
 
     /**
