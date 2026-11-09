@@ -1,4 +1,4 @@
-/** 运行页面只读取任务事实；诊断按需触发，客户端心跳不代表支付平台在线，也不提供进程控制入口。 */
+/** 展示任务事实及受控缓存清理；客户端心跳不代表支付平台在线，不提供进程控制入口。 */
 MpayAdmin.ready(function () {
     'use strict';
     const UI = MpayAdmin,
@@ -122,10 +122,16 @@ MpayAdmin.ready(function () {
                         templet: (row) => {
                             const error = row.last_error
                                 ? '<div class="admin-runtime-error"><span class="admin-runtime-error-message" title="' +
-                                  E(row.last_error.message) + '">' + E(row.last_error.message) + '</span>' +
-                                  (row.recovered_at ? UI.badge('已恢复', 'green') : '') + '</div>'
+                                  E(row.last_error.message) +
+                                  '">' +
+                                  E(row.last_error.message) +
+                                  '</span>' +
+                                  (row.recovered_at ? UI.badge('已恢复', 'green') : '') +
+                                  '</div>'
                                 : '';
-                            const heartbeat = row.heartbeat_note ? '<div>' + E(row.heartbeat_note) + '</div>' : '';
+                            const heartbeat = row.heartbeat_note
+                                ? '<div>' + E(row.heartbeat_note) + '</div>'
+                                : '';
                             return error + heartbeat || '—';
                         },
                     },
@@ -194,20 +200,30 @@ MpayAdmin.ready(function () {
                     '通道启用': item.enabled,
                     '待核对订单': item.pending_count,
                     '最近活动': item.last_activity_at,
-                    '活动类型': item.collector ? '最近查单成功' : '最近有效客户端心跳',
-                    '最近登录验证': item.last_verified_at,
-                    '关联批次确认笔数': item.matched_count,
-                    '连续失败批次': item.consecutive_failures,
-                    '最近耗时（毫秒）': item.last_duration_ms,
+                    '活动类型': item.collector
+                        ? '最近查单成功'
+                        : item.listener
+                          ? '最近有效客户端心跳'
+                          : '暂无活动记录',
+                    ...(item.collector
+                        ? {
+                              '最近登录验证': item.last_verified_at,
+                              '关联批次确认笔数': item.matched_count,
+                              '连续失败批次': item.consecutive_failures,
+                              '最近耗时（毫秒）': item.last_duration_ms,
+                          }
+                        : {}),
                     '处理说明': item.reason_label,
                 }) +
-                (item.listener ? UI.facts({
-                    '监听应用': item.listener.package_name,
-                    '最近上报设备': item.listener.device_name,
-                    '客户端': item.listener.client,
-                    '上报监听状态': item.listener.listening ? '正在监听' : '未在监听',
-                    '最近心跳': when(item.listener.received_at),
-                }) + UI.notice('心跳仅表示客户端上报情况，不代表支付应用登录或收款能力。') : '') +
+                (item.listener
+                    ? UI.facts({
+                          '监听应用': item.listener.package_name,
+                          '最近上报设备': item.listener.device_name,
+                          '客户端': item.listener.client,
+                          '上报监听状态': item.listener.listening ? '正在监听' : '未在监听',
+                          '最近心跳': when(item.listener.received_at),
+                      }) + UI.notice('心跳仅表示客户端上报情况，不代表支付应用登录或收款能力。')
+                    : '') +
                 '<details class="admin-details"><summary>技术信息</summary>' +
                 UI.facts({
                     '插件': item.plugin_code,
@@ -217,6 +233,45 @@ MpayAdmin.ready(function () {
                 '</details><a class="layui-btn layui-btn-primary" href="/admin/configurations?configuration_id=' +
                 encodeURIComponent(item.configuration_id) +
                 '">查看收款通道</a>',
+        });
+    });
+    document.getElementById('runtime-clear-cache').addEventListener('click', () => {
+        UI.form({
+            title: '清理缓存',
+            width: 520,
+            submit: '确认清理',
+            content:
+                UI.notice(
+                    '清理后，页面缓存和运行状态会随访问、采集及心跳重新生成。订单、收款记录、后台登录和插件登录信息保留。',
+                ) +
+                '<div class="layui-form-item"><input type="checkbox" name="ordinary" title="普通缓存（含编译模板）" lay-skin="primary" checked></div>' +
+                '<div class="layui-form-item"><input type="checkbox" name="runtime_status" title="通道运行状态缓存（采集摘要、客户端心跳）" lay-skin="primary" checked></div>',
+            async onSubmit(form, handle) {
+                const result = (
+                    await MpayHttp.request('/adminapi/maintenance/cache/clear', {
+                        method: 'POST',
+                        timeout: 30000,
+                        data: {
+                            ordinary: form.elements.ordinary.checked,
+                            runtime_status: form.elements.runtime_status.checked,
+                        },
+                    })
+                ).data;
+                handle.clean();
+                overview();
+                collections(page);
+                if (result.failed.length) {
+                    const labels = { ordinary: '普通缓存', runtime_status: '通道运行状态缓存' };
+                    handle.feedback(
+                        result.failed.map((scope) => labels[scope]).join('、') +
+                            '未完全清理，请检查运行目录权限及操作日志。',
+                        'error',
+                    );
+                    return;
+                }
+                handle.close();
+                UI.feedback(feedback, '缓存已清理，运行状态将随真实活动重新生成。', 'success');
+            },
         });
     });
     document.getElementById('runtime-doctor').addEventListener('click', () => {

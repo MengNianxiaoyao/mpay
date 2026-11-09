@@ -65,8 +65,16 @@ Route::group('adminapi', function (): void {
                 ->name('admin.catalog.enabled')
                 ->middleware('admin.configuration.write');
         });
-        // URL 避开 runtime 目录保护规则；原 Session、管理员认证及只读方法限制保持一致。
+        // URL 避开 runtime 目录保护规则；查询只读，清理缓存单独使用 POST/CSRF。
         Route::group('maintenance', function (): void {
+            Route::post('cache/clear', [RuntimeController::class, 'clearCache'])
+                ->name('admin.maintenance.cache.clear')
+                ->middleware('rate', [
+                    'rule' => 'admin_expensive',
+                    'identity' => 'admin',
+                    'action' => 'cache_clear',
+                ])
+                ->middleware('admin.write');
             Route::rule('', [RuntimeController::class, 'overview'], 'GET|HEAD')->name(
                 'admin.maintenance',
             );

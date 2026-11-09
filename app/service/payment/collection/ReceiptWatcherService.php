@@ -3,7 +3,6 @@ declare(strict_types=1);
 
 namespace app\service\payment\collection;
 
-use app\common\constant\ReceiptRuntimeConstant;
 use app\common\interface\ReceiptCollectorInterface;
 use app\common\util\Clock;
 use app\common\util\SafeLogger;
@@ -14,6 +13,7 @@ use app\repository\payment\config\PaymentPluginConfRepository;
 use app\repository\payment\trade\PayOrderRepository;
 use app\service\payment\plugin\PaymentPluginFactoryService;
 use app\service\payment\receipt\PayOrderCallbackService;
+use app\service\system\runtime\RuntimeStatusService;
 use PDOException;
 use RuntimeException;
 use think\Cache;
@@ -29,13 +29,6 @@ use UnexpectedValueException;
  */
 final class ReceiptWatcherService
 {
-    private const SUMMARY_WRITE_INTERVAL_NANOSECONDS = 10_000_000_000;
-
-    /** @var array<string,array{state:array<string,mixed>,due_at:int}> due_at 为单调时钟纳秒；仅缓冲展示摘要。 */
-    private array $pendingActivity = [];
-    /** @var array<string,int> 最近 10 秒内成功写入的单调时间，过期项随循环清理，不长期积累通道。 */
-    private array $activityWrittenAt = [];
-
     /** @var array<string,int> 未能形成正常账号批次的插件退避；不接管插件已有的账号重试状态。 */
     private array $retryAt = [];
 
@@ -49,6 +42,7 @@ final class ReceiptWatcherService
         private readonly Cache $cache,
         private readonly Config $config,
         private readonly SafeLogger $logger,
+        private readonly RuntimeStatusService $runtime,
     ) {}
 
     /**
@@ -299,6 +293,8 @@ final class ReceiptWatcherService
                 'channel_id' => $revision['channel_id'],
                 'api_config_id' => $revision['api_config_id'],
                 'config_version' => $revision['config_version'],
+                'config_created_at' =>
+                    $configuration === null ? null : $configuration['created_at'],
                 'plugin_code' => $code,
                 'receipt_scope_key' => $snapshot['channel']['receipt_scope_key'],
                 'configuration' => $snapshot['configuration'],
@@ -381,22 +377,7 @@ final class ReceiptWatcherService
      */
     public function flushActivity(bool $force = false): void
     {
-        $now = hrtime(true);
-        foreach ($this->activityWrittenAt as $key => $writtenAt) {
-            if ($now - $writtenAt >= self::SUMMARY_WRITE_INTERVAL_NANOSECONDS) {
-                unset($this->activityWrittenAt[$key]);
-            }
-        }
-        if ($this->pendingActivity === []) {
-            return;
-        }
-        $store = $this->cache->store('receipt');
-        foreach ($this->pendingActivity as $key => $pending) {
-            if (($force || $pending['due_at'] <= $now) && $store->set($key, $pending['state'], 0)) {
-                $this->activityWrittenAt[$key] = $now;
-                unset($this->pendingActivity[$key]);
-            }
-        }
+        $this->runtime->flushCollections($force);
     }
 
     /** 普通展示摘要按 10 秒合并；首次、版本/状态变化、失败和确认到账立即写，日志保留原策略。 */
@@ -409,64 +390,19 @@ final class ReceiptWatcherService
         bool $limited,
         int $started,
     ): void {
-        $store = $this->cache->store('receipt');
-        $now = $this->clock->now();
+        $now = $this->clock->now()->format('Y-m-d H:i:s');
         foreach ($channels as $channel) {
-            $key = 'collection.summary.' . $channel['api_config_id'];
-            $previous = $this->pendingActivity[$key]['state'] ?? $store->get($key, []);
-            $previous = is_array($previous) ? $previous : [];
-            $state = $previous;
-            $versionChanged = ($state['config_version'] ?? null) !== $channel['config_version'];
-            if ($versionChanged) {
-                $state = [];
-            }
-            $state['config_version'] = $channel['config_version'];
-            $state['status'] =
-                $error === null
-                    ? ReceiptRuntimeConstant::HEALTHY
-                    : ReceiptRuntimeConstant::failure($error['reason']);
-            $state['reason_code'] = $error['reason'] ?? ($limited ? 'limit_reached' : null);
-            $state['last_duration_ms'] = (int) ((hrtime(true) - $started) / 1000000);
-            $state['updated_at'] = $now->format('Y-m-d H:i:s');
-            if ($error !== null) {
-                // 仅保存最近一次失败；恢复后保留供排查，不重写成成功或清掉历史错误。
-                $state['last_error'] = array_diff_key($error, ['retry_after' => true]) + [
-                    'occurred_at' => $state['updated_at'],
-                ];
-                $state['recovered_at'] = null;
-            } elseif (isset($state['last_error']) && empty($state['recovered_at'])) {
-                $state['recovered_at'] = $state['updated_at'];
-            }
-            $state['consecutive_failures'] =
-                $error === null ? 0 : (int) ($state['consecutive_failures'] ?? 0) + 1;
-            if ($error === null) {
-                $state['last_verified_at'] = $state['updated_at'];
-                if (!$probe) {
-                    $state['last_success_at'] = $state['updated_at'];
-                    $state['matched_count'] = $matched;
-                }
-            }
-            $important =
-                $error !== null ||
-                $matched > 0 ||
-                $versionChanged ||
-                ($previous['status'] ?? null) !== $state['status'] ||
-                ($previous['reason_code'] ?? null) !== $state['reason_code'] ||
-                (!$probe && !isset($previous['last_success_at'])) ||
-                ($probe && !isset($previous['last_verified_at']));
-            $tick = hrtime(true);
-            $writtenAt = $this->activityWrittenAt[$key] ?? null;
-            $dueAt = ($writtenAt ?? 0) + self::SUMMARY_WRITE_INTERVAL_NANOSECONDS;
-            if ($important || $writtenAt === null || $dueAt <= $tick) {
-                if ($store->set($key, $state, 0)) {
-                    $this->activityWrittenAt[$key] = $tick;
-                    unset($this->pendingActivity[$key]);
-                } else {
-                    // 未写成功不消耗节流时间，下一次循环继续尝试保存展示状态。
-                    $this->pendingActivity[$key] = ['state' => $state, 'due_at' => $tick];
-                }
-            } else {
-                $this->pendingActivity[$key] = ['state' => $state, 'due_at' => $dueAt];
+            $duration = (int) ((hrtime(true) - $started) / 1000000);
+            // 配置缺失不影响原单采集，仅不为已不存在的配置建立展示快照。
+            if ($channel['config_created_at'] !== null) {
+                $this->runtime->recordCollection($channel, [
+                    'error' => $error,
+                    'probe' => $probe,
+                    'matched' => $matched,
+                    'limited' => $limited,
+                    'duration_ms' => $duration,
+                    'occurred_at' => $now,
+                ]);
             }
             $this->logger->record(
                 $probe ? 'receipt.prelogin' : 'receipt.collection',
@@ -475,7 +411,7 @@ final class ReceiptWatcherService
                     'api_config_id' => $channel['api_config_id'],
                     'config_version' => $channel['config_version'],
                     'channel_id' => $channel['channel_id'],
-                    'duration_ms' => $state['last_duration_ms'],
+                    'duration_ms' => $duration,
                     'reason_code' => $error['reason'] ?? ($limited ? 'limit_reached' : 'completed'),
                     'error_source' => $error['source'] ?? null,
                     'error_stage' => $error['stage'] ?? null,

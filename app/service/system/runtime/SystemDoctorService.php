@@ -143,6 +143,7 @@ final class SystemDoctorService
                 ReceiptRuntimeConstant::HEALTHY,
                 ReceiptRuntimeConstant::IDLE,
                 ReceiptRuntimeConstant::PUSH,
+                ReceiptRuntimeConstant::LISTENING,
             ]);
             $labels = [];
             foreach ($states as $status => $count) {
@@ -151,8 +152,8 @@ final class SystemDoctorService
             return [
                 $states === [] || $attention !== [] ? 'warning' : 'ok',
                 $states === []
-                    ? '尚无账号运行态，不能判断平台可用'
-                    : '账号采集状态：' . implode('；', $labels),
+                    ? '尚无通道运行记录，不能判断平台可用'
+                    : '通道运行状态：' . implode('；', $labels),
             ];
         });
         $checks[] = $this->check('workers', fn(): array => $this->workers());

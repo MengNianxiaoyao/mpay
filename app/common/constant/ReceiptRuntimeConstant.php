@@ -20,6 +20,7 @@ final class ReceiptRuntimeConstant
     public const HEARTBEAT_TIMEOUT = 13;
 
     public const LABELS = [
+        'not_initialized' => '尚无运行记录',
         self::IDLE => '等待采集',
         self::HEALTHY => '上次采集或认证活动正常',
         self::RETRYING => '等待重试',

@@ -472,10 +472,27 @@ final class WechatReceiptPayment extends BasePayment implements PaymentInterface
             ) ||
             !is_string($content['msg'] ?? null) ||
             !preg_match(
-                '/(?:到账|收款|收款到账|付款)\s*[¥￥]?\s*(\d+(?:\.\d{1,2})?)\s*(?:元)?/u',
+                '/(?:二维码赞赏到账|收款到账|成功收款|收款|到账|付款)\s*[¥￥]?\s*([0-9]+(?:\.[0-9]{1,2})?)\s*(?:元|$)/u',
                 $content['msg'],
                 $amount,
+                PREG_OFFSET_CAPTURE,
             )
+        ) {
+            throw new ReceiptMessageException('unsupported_message');
+        }
+        // 只判断本次金额之前的动作，不扫描后面的备注；“某某付款”仍是有效候选。
+        $prefix = substr($content['msg'], 0, $amount[0][1]);
+        if (
+            (str_contains($amount[0][0], '到账') &&
+                preg_match(
+                    '/(?:退款|退回|退还|提现|转出|支出)(?:款项|金额|通知|已|成功|完成|[\s:：，,])*$/u',
+                    $prefix,
+                )) ||
+            (str_starts_with($amount[0][0], '付款') &&
+                preg_match(
+                    '/(?:你|您)(?:已经|已)?(?:向|给)[^:：，,。；;\r\n]*$|(?:你|您)(?:已经|已)$/u',
+                    $prefix,
+                ))
         ) {
             throw new ReceiptMessageException('unsupported_message');
         }
@@ -504,7 +521,7 @@ final class WechatReceiptPayment extends BasePayment implements PaymentInterface
                 30,
             );
         try {
-            $cents = Money::parse($amount[1]);
+            $cents = Money::parse($amount[1][0]);
         } catch (InvalidArgumentException) {
             throw new ReceiptMessageException('invalid_message');
         }

@@ -97,9 +97,12 @@ MpayAdmin.ready(function () {
         'poll_group.create': '新增轮询组',
         'poll_group.save': '修改轮询组',
         'system.configuration': '修改系统设置',
+        'runtime.cache.clear': '清理运行缓存',
         'file.upload': '上传图片',
     };
     const results = {
+        started: '已开始',
+        cleared: '已清理',
         accepted: '成功',
         created: '已创建',
         updated: '已更新',
@@ -114,6 +117,7 @@ MpayAdmin.ready(function () {
         invalid_credentials: '认证未通过',
     };
     const targets = {
+        runtime_cache: '运行缓存',
         payment_channel: '收款通道',
         payment_plugin_conf: '插件配置',
         payment_app: '接入应用',
@@ -130,6 +134,8 @@ MpayAdmin.ready(function () {
         recordsTable = null;
     const notificationTones = { 0: 'orange', 1: 'blue', 2: 'green', 3: 'orange', 4: 'gray' };
     const resultTones = {
+        started: 'blue',
+        cleared: 'green',
         accepted: 'green',
         created: 'green',
         updated: 'green',

@@ -14,7 +14,6 @@ use app\repository\system\RuntimeDiagnosticRepository;
 use app\service\payment\plugin\PaymentPluginFactoryService;
 use Composer\InstalledVersions;
 use PDOException;
-use think\Cache;
 use think\Config;
 use think\db\exception\DbException;
 use Throwable;
@@ -44,7 +43,6 @@ final class RuntimeQueryService extends BaseService
         private readonly RuntimeDiagnosticRepository $records,
         private readonly RuntimeStatusService $workers,
         private readonly Clock $clock,
-        private readonly Cache $cache,
         private readonly Config $config,
         private readonly PaymentPluginFactoryService $plugins,
     ) {}
@@ -95,7 +93,6 @@ final class RuntimeQueryService extends BaseService
             'device_status' => 'unknown',
             'observed_at' => $now,
             'status_options' => self::STATUSES + [
-                'not_initialized' => '尚无运行记录',
                 'unknown' => '未知状态，需核对',
             ],
         ];
@@ -110,7 +107,7 @@ final class RuntimeQueryService extends BaseService
         if (
             isset($filters['status']) &&
             !array_key_exists($filters['status'], self::STATUSES) &&
-            !in_array($filters['status'], ['not_initialized', 'unknown'], true)
+            $filters['status'] !== 'unknown'
         ) {
             throw new BusinessException(
                 '不支持的运行状态筛选',
@@ -157,7 +154,6 @@ final class RuntimeQueryService extends BaseService
                 ->format('Y-m-d H:i:s'),
             $configurationIds,
         );
-        $store = $this->cache->store('receipt');
         // 只读取当前行涉及的插件定义，不扫描目录，也不为能力展示另建执行实例。
         $collectors = [];
         $items = [];
@@ -179,15 +175,16 @@ final class RuntimeQueryService extends BaseService
                     $collectors[$code] = null;
                 }
             }
-            $state = $store->get('collection.summary.' . $row['id'], []);
-            if (
-                !is_array($state) ||
-                ($state['config_version'] ?? null) !== (int) $row['config_version']
-            ) {
-                $state = [];
-            }
+            $configuration = [
+                'plugin_code' => $code,
+                'api_config_id' => (string) $row['id'],
+                'config_version' => (int) $row['config_version'],
+                'config_created_at' => $row['created_at'],
+            ];
+            // 能力决定读取哪种事实；未知/推送插件不能携带采集错误和登录时间。
+            $state = $collectors[$code] === true ? $this->workers->collection($configuration) : [];
             $count = $pending[$row['id']] ?? 0;
-            $status = $state['status'] ?? ReceiptRuntimeConstant::IDLE;
+            $status = $state['status'] ?? 'not_initialized';
             if (!isset(self::STATUSES[$status])) {
                 $status = 'unknown';
             }
@@ -198,16 +195,21 @@ final class RuntimeQueryService extends BaseService
             } elseif (!(int) $row['enabled'] && $count === 0) {
                 $status = ReceiptRuntimeConstant::PAUSED;
             }
-            $listener = $collectors[$code] === false
-                ? $this->workers->listener((string) $row['channel_id'], (string) $row['id'], (int) $row['config_version'])
-                : null;
+            $listener =
+                $collectors[$code] === false ? $this->workers->listener($configuration) : null;
             $heartbeatNote = null;
             if ($listener !== null) {
                 if (!$listener['listening']) {
                     $status = ReceiptRuntimeConstant::LISTENER_STOPPED;
-                } elseif ($now - $listener['received_at'] > RuntimeStatusService::LISTENER_TIMEOUT_SECONDS) {
+                } elseif (
+                    $now - $listener['received_at'] >
+                    RuntimeStatusService::LISTENER_TIMEOUT_SECONDS
+                ) {
                     $status = ReceiptRuntimeConstant::HEARTBEAT_TIMEOUT;
-                    $heartbeatNote = '已超过 ' . RuntimeStatusService::LISTENER_TIMEOUT_SECONDS . ' 秒未收到心跳';
+                    $heartbeatNote =
+                        '已超过 ' .
+                        RuntimeStatusService::LISTENER_TIMEOUT_SECONDS .
+                        ' 秒未收到心跳';
                 } else {
                     $status = ReceiptRuntimeConstant::LISTENING;
                 }
@@ -257,9 +259,12 @@ final class RuntimeQueryService extends BaseService
                 'last_error' => $diagnostic,
                 'heartbeat_note' => $heartbeatNote,
                 'listener' => $listener,
-                'last_activity_at' => $listener === null
-                    ? ($state['last_success_at'] ?? null)
-                    : date('Y-m-d H:i:s', $listener['received_at']),
+                'last_activity_at' =>
+                    $collectors[$code] === true
+                        ? $state['last_success_at'] ?? null
+                        : ($listener === null
+                            ? null
+                            : date('Y-m-d H:i:s', $listener['received_at'])),
                 'recovered_at' => $state['recovered_at'] ?? null,
                 'pending_count' => $count,
                 'reason_label' =>
@@ -272,8 +277,11 @@ final class RuntimeQueryService extends BaseService
                 'last_verified_at' => $state['last_verified_at'] ?? null,
                 'last_duration_ms' => $state['last_duration_ms'] ?? null,
                 'matched_count' => $state['matched_count'] ?? null,
-                'consecutive_failures' => $collectors[$code] === true ? ($state['consecutive_failures'] ?? 0) : null,
-                'updated_at' => $state['updated_at'] ?? null,
+                'consecutive_failures' => $state['consecutive_failures'] ?? null,
+                'updated_at' =>
+                    $listener === null
+                        ? $state['updated_at'] ?? null
+                        : date('Y-m-d H:i:s', $listener['received_at']),
                 'device_status' => 'unknown',
             ];
         }

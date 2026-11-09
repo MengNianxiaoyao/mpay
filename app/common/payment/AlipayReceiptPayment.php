@@ -454,15 +454,33 @@ final class AlipayReceiptPayment extends BasePayment implements PaymentInterface
         if ($heartbeat !== null) {
             return $heartbeat;
         }
-        if (
-            !is_string($content['title'] ?? null) ||
-            !is_string($content['msg'] ?? null)
-        ) {
+        if (!is_string($content['title'] ?? null) || !is_string($content['msg'] ?? null)) {
             throw new ReceiptMessageException('invalid_message');
         }
         $text = $content['title'] === '收款通知' ? $content['msg'] : $content['title'];
         if (
-            !preg_match('/(?:到账|收款|成功收款|付款)\s*(\d+(?:\.\d{1,2})?)\s*元/u', $text, $amount)
+            !preg_match(
+                '/(?:成功收款|收款到账|收款|到账|付款)\s*[¥￥]?\s*([0-9]+(?:\.[0-9]{1,2})?)\s*(?:元|$)/u',
+                $text,
+                $amount,
+                PREG_OFFSET_CAPTURE,
+            )
+        ) {
+            throw new ReceiptMessageException('unsupported_message');
+        }
+        // 收支判断绑定本次金额的前缀；不因收款后的备注或营销说明出现“退款”而拒绝。
+        $prefix = substr($text, 0, $amount[0][1]);
+        if (
+            (str_contains($amount[0][0], '到账') &&
+                preg_match(
+                    '/(?:退款|退回|退还|提现|转出|支出)(?:款项|金额|通知|已|成功|完成|[\s:：，,])*$/u',
+                    $prefix,
+                )) ||
+            (str_starts_with($amount[0][0], '付款') &&
+                preg_match(
+                    '/(?:你|您)(?:已经|已)?(?:向|给)[^:：，,。；;\r\n]*$|(?:你|您)(?:已经|已)$/u',
+                    $prefix,
+                ))
         ) {
             throw new ReceiptMessageException('unsupported_message');
         }
@@ -490,7 +508,7 @@ final class AlipayReceiptPayment extends BasePayment implements PaymentInterface
                 30,
             );
         try {
-            $cents = Money::parse($amount[1]);
+            $cents = Money::parse($amount[1][0]);
         } catch (InvalidArgumentException) {
             // 外部消息金额不合法属于通知拒绝，保留金额上限校验。
             throw new ReceiptMessageException('invalid_message');

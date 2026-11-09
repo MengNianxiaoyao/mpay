@@ -15,6 +15,7 @@ final readonly class ChannelNotifyContext
      * @param array<string,mixed> $configuration 通道当前配置或原支付单冻结配置，禁止传给页面。
      * @param DateTimeImmutable $receivedAt 入口统一接收时间，同时传给插件作无来源付款时间时的缺省值。
      * @param string|null $payNo 支付号入口限定的原单；通道通知/采集由插件定位时为 null。
+     * @param string|null $configurationCreatedAt 通道入口读取的配置创建时间，仅用于运行快照归属。
      */
     public function __construct(
         public string $channelId,
@@ -27,6 +28,7 @@ final readonly class ChannelNotifyContext
         public array $configuration,
         public DateTimeImmutable $receivedAt,
         public ?string $payNo = null,
+        public ?string $configurationCreatedAt = null,
     ) {
         if ($configurationVersion < 1) {
             throw new InvalidArgumentException('来源上下文的配置版本无效');

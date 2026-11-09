@@ -5,13 +5,32 @@ namespace app\http\admin\controller;
 
 use app\common\base\BaseAdminController;
 use app\http\admin\validation\RuntimeQueryValidator;
+use app\http\admin\validation\RuntimeCacheValidator;
+use app\service\system\audit\ConfigurationActionContext;
+use app\service\system\runtime\RuntimeCacheService;
 use app\service\system\runtime\RuntimeQueryService;
 use app\service\system\runtime\SystemDoctorService;
 use think\Response;
 
-/** 运行维护的只读入口；浏览器不具备执行 shell、迁移、文件清理或平台登录的入口。 */
+/** 运行诊断和受控缓存清理；不开放任意路径、shell、迁移、进程控制或平台登录。 */
 final class RuntimeController extends BaseAdminController
 {
+    public function clearCache(
+        RuntimeCacheValidator $validator,
+        RuntimeCacheService $cache,
+    ): Response {
+        $scopes = $validator->clear($this->jsonBody());
+        $identity = $this->identity();
+        $actor = ConfigurationActionContext::administrator(
+            $identity['id'],
+            $identity['session_version'],
+            $this->context->id(),
+            null,
+            (string) $this->request->server('REMOTE_ADDR', ''),
+        );
+        return $this->success($cache->clear($scopes, $actor));
+    }
+
     public function overview(RuntimeQueryValidator $validator, RuntimeQueryService $query): Response
     {
         $validator->emptyQuery($this->request->get());

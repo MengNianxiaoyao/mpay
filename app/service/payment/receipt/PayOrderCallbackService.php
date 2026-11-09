@@ -126,12 +126,18 @@ final class PayOrderCallbackService extends BaseService
                     throw new UnexpectedValueException('监听状态必须为布尔值');
                 }
                 if ($context->payNo !== null) {
-                    throw new BusinessException('监听心跳请使用通道通知地址', ApiResponseConstant::BAD_REQUEST);
+                    throw new BusinessException(
+                        '监听心跳请使用通道通知地址',
+                        ApiResponseConstant::BAD_REQUEST,
+                    );
                 }
                 $this->runtime->recordListener(
-                    $channelId,
-                    $context->configurationId,
-                    $context->configurationVersion,
+                    [
+                        'plugin_code' => $context->pluginCode,
+                        'api_config_id' => $context->configurationId,
+                        'config_version' => $context->configurationVersion,
+                        'config_created_at' => $context->configurationCreatedAt,
+                    ],
                     $context->receivedAt->getTimestamp(),
                     $notificationResult,
                 );
@@ -582,6 +588,7 @@ final class PayOrderCallbackService extends BaseService
                 $payType,
                 $configuration['config_json'],
                 $this->clock->now(),
+                configurationCreatedAt: $configuration['created_at'],
             );
         });
     }

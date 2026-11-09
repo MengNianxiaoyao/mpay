@@ -3,6 +3,8 @@ declare(strict_types=1);
 
 namespace app\service\system\runtime;
 
+use app\common\constant\ReceiptRuntimeConstant;
+
 use RuntimeException;
 use think\App;
 use think\Cache;
@@ -13,40 +15,155 @@ final class RuntimeStatusService
     // 客户端约 60 秒上报，允许三个周期；仅用于运行展示，不控制通道或订单。
     public const LISTENER_TIMEOUT_SECONDS = 180;
 
+    private const SUMMARY_WRITE_INTERVAL_NANOSECONDS = 10_000_000_000;
+
+    /** @var array<string,array{changes:array,due_at:int}> 只缓冲本次活动字段，不携带缓存中的历史错误。 */
+    private array $pendingCollections = [];
+    /** @var array<string,int> 最近一次写入的单调时间；到期即移除。 */
+    private array $collectionWrittenAt = [];
+
     public function __construct(private readonly App $app, private readonly Cache $cache) {}
 
-    /** 每通道只覆盖最新快照，使用服务端接收时间；不写数据库或逐条回调日志。 */
-    public function recordListener(
-        string $channelId,
-        string $configurationId,
-        int $configurationVersion,
-        int $receivedAt,
-        array $heartbeat,
-    ): void {
-        $saved = $this->cache->store('receipt')->set('listener.heartbeat.' . $channelId, [
-            'configuration_id' => $configurationId,
-            'config_version' => $configurationVersion,
-            'received_at' => $receivedAt,
-            'listening' => $heartbeat['listening'],
-            'package_name' => $heartbeat['package_name'],
-            'device_name' => $heartbeat['device_name'],
-            'client' => $heartbeat['client'],
-        ], 0);
+    /**
+     * 展示快照统一按配置身份隔离；创建时间防止清库后 ID/版本复用，旧版本不会覆盖当前版本。
+     * @param array{plugin_code:string,api_config_id:string,config_version:int,config_created_at:string} $configuration
+     */
+    private function key(string $kind, array $configuration): string
+    {
+        return implode('|', [
+            $kind,
+            $configuration['plugin_code'],
+            $configuration['api_config_id'],
+            $configuration['config_version'],
+            $configuration['config_created_at'],
+        ]);
+    }
+
+    /** 每份配置只覆盖最新心跳，使用服务端接收时间；不写数据库或逐条回调日志。 */
+    public function recordListener(array $configuration, int $receivedAt, array $heartbeat): void
+    {
+        $saved = $this->cache->store('runtime_status')->set(
+            $this->key('listener', $configuration),
+            [
+                'received_at' => $receivedAt,
+                'listening' => $heartbeat['listening'],
+                'package_name' => $heartbeat['package_name'],
+                'device_name' => $heartbeat['device_name'],
+                'client' => $heartbeat['client'],
+            ],
+            0,
+        );
         if (!$saved) {
             throw new RuntimeException('监听状态保存失败');
         }
     }
 
     /** 当前配置以外的快照不当作当前状态，缓存缺失表示尚无上报。 */
-    public function listener(string $channelId, string $configurationId, int $configurationVersion): ?array
+    public function listener(array $configuration): ?array
     {
-        $state = $this->cache->store('receipt')->get('listener.heartbeat.' . $channelId);
-        return is_array($state)
-            && ($state['configuration_id'] ?? null) === $configurationId
-            && ($state['config_version'] ?? null) === $configurationVersion
-            && is_int($state['received_at'] ?? null)
-            && is_bool($state['listening'] ?? null)
-            ? $state : null;
+        $state = $this->cache->store('runtime_status')->get($this->key('listener', $configuration));
+        return is_array($state) &&
+            is_int($state['received_at'] ?? null) &&
+            is_bool($state['listening'] ?? null)
+            ? $state
+            : null;
+    }
+
+    /** 缺失即尚无记录，不读取旧位置或其他配置的摘要。 */
+    public function collection(array $configuration): array
+    {
+        $state = $this->cache
+            ->store('runtime_status')
+            ->get($this->key('collection', $configuration));
+        return is_array($state) ? $state : [];
+    }
+
+    /**
+     * 普通活动合并为每 10 秒一次写入；首次、失败、状态变化及确认到账立即保存。
+     * @param array{error:?array,probe:bool,matched:int,limited:bool,duration_ms:int,occurred_at:string} $activity
+     */
+    public function recordCollection(array $configuration, array $activity): void
+    {
+        $key = $this->key('collection', $configuration);
+        $previous = $this->collection($configuration);
+        // 清理后不复用内存中的旧活动，只有本次真实活动可重新建立摘要。
+        $changes = $previous === [] ? [] : $this->pendingCollections[$key]['changes'] ?? [];
+        $error = $activity['error'];
+        $now = $activity['occurred_at'];
+        $changes = array_replace($changes, [
+            'status' =>
+                $error === null
+                    ? ReceiptRuntimeConstant::HEALTHY
+                    : ReceiptRuntimeConstant::failure($error['reason']),
+            'reason_code' => $error['reason'] ?? ($activity['limited'] ? 'limit_reached' : null),
+            'last_duration_ms' => $activity['duration_ms'],
+            'updated_at' => $now,
+            'consecutive_failures' =>
+                $error === null ? 0 : (int) ($previous['consecutive_failures'] ?? 0) + 1,
+        ]);
+        if ($error !== null) {
+            $changes['last_error'] = array_diff_key($error, ['retry_after' => true]) + [
+                'occurred_at' => $now,
+            ];
+            $changes['recovered_at'] = null;
+        } else {
+            if (isset($previous['last_error']) && empty($previous['recovered_at'])) {
+                $changes['recovered_at'] = $now;
+            }
+            $changes['last_verified_at'] = $now;
+            if (!$activity['probe']) {
+                $changes['last_success_at'] = $now;
+                $changes['matched_count'] = $activity['matched'];
+            }
+        }
+        $important =
+            $error !== null ||
+            $activity['matched'] > 0 ||
+            $previous === [] ||
+            ($previous['status'] ?? null) !== $changes['status'] ||
+            ($previous['reason_code'] ?? null) !== $changes['reason_code'] ||
+            (!$activity['probe'] && !isset($previous['last_success_at'])) ||
+            ($activity['probe'] && !isset($previous['last_verified_at']));
+        $tick = hrtime(true);
+        $writtenAt = $this->collectionWrittenAt[$key] ?? null;
+        $dueAt = ($writtenAt ?? 0) + self::SUMMARY_WRITE_INTERVAL_NANOSECONDS;
+        if ($important || $writtenAt === null || $dueAt <= $tick) {
+            if (
+                $this->cache
+                    ->store('runtime_status')
+                    ->set($key, array_replace($previous, $changes), 0)
+            ) {
+                $this->collectionWrittenAt[$key] = $tick;
+                unset($this->pendingCollections[$key]);
+                return;
+            }
+            $dueAt = $tick;
+        }
+        $this->pendingCollections[$key] = ['changes' => $changes, 'due_at' => $dueAt];
+    }
+
+    /** 等待期间/正常退出保存到期字段；已清理的摘要直接丢弃缓冲，不让旧错误重新出现。 */
+    public function flushCollections(bool $force = false): void
+    {
+        $now = hrtime(true);
+        foreach ($this->collectionWrittenAt as $key => $writtenAt) {
+            if ($now - $writtenAt >= self::SUMMARY_WRITE_INTERVAL_NANOSECONDS) {
+                unset($this->collectionWrittenAt[$key]);
+            }
+        }
+        $store = $this->cache->store('runtime_status');
+        foreach ($this->pendingCollections as $key => $pending) {
+            if (!$force && $pending['due_at'] > $now) {
+                continue;
+            }
+            $state = $store->get($key);
+            if (!is_array($state)) {
+                unset($this->pendingCollections[$key], $this->collectionWrittenAt[$key]);
+            } elseif ($store->set($key, array_replace($state, $pending['changes']), 0)) {
+                $this->collectionWrittenAt[$key] = $now;
+                unset($this->pendingCollections[$key]);
+            }
+        }
     }
 
     /**
